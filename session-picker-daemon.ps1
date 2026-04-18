@@ -328,6 +328,15 @@ $activate = {
         Remove-Item -LiteralPath $s.File -ErrorAction SilentlyContinue
     } else {
         [W.P]::SwitchToThisWindow([IntPtr]([int64]$s.Hwnd), $true)
+        # User opened this terminal via picker -- clear 'done' dot. Leaves
+        # 'running' alone (still in progress) and 'idle' alone (nothing to clear).
+        try {
+            if ($s.SessionId -and $s.Status -eq 'done') {
+                $statusFile = Join-Path $env:USERPROFILE ".claude\session-windows\$($s.SessionId).status"
+                Remove-Item -LiteralPath $statusFile -ErrorAction SilentlyContinue
+                Log "cleared done status for $($s.SessionId)"
+            }
+        } catch { Log "clear status error: $_" }
     }
     $script:window.Hide()
 }
@@ -362,6 +371,24 @@ $script:window.Add_KeyDown({
         $script:list.SelectedIndex = $digit - 1
         & $activate
     }
+})
+# ListBoxItem Focusable=False (needed for our keyboard hook design) disables the
+# default click-to-select. Re-wire it explicitly: walk up the visual tree to find
+# the clicked ListBoxItem and sync SelectedIndex, so both single-click highlight
+# and double-click activation work.
+$script:list.Add_PreviewMouseLeftButtonDown({
+    param($sender, $e)
+    try {
+        $src = $e.OriginalSource
+        while ($src -and -not ($src -is [System.Windows.Controls.ListBoxItem])) {
+            if (-not ($src -is [System.Windows.DependencyObject])) { $src = $null; break }
+            $src = [System.Windows.Media.VisualTreeHelper]::GetParent($src)
+        }
+        if ($src) {
+            $idx = $script:list.ItemContainerGenerator.IndexFromContainer($src)
+            if ($idx -ge 0) { $script:list.SelectedIndex = $idx }
+        }
+    } catch { Log "mouse select error: $_" }
 })
 $script:list.Add_MouseDoubleClick({ & $activate })
 
@@ -408,7 +435,7 @@ function Update-StatusIcons {
             $iconLbl.Foreground = [System.Windows.Media.Brushes]::LimeGreen
         } elseif ($st -eq 'done') {
             $iconLbl.Text = $script:doneChar
-            $iconLbl.Foreground = [System.Windows.Media.Brushes]::OrangeRed
+            $iconLbl.Foreground = [System.Windows.Media.Brushes]::Orange
         } else {
             $iconLbl.Text = ' '
         }
