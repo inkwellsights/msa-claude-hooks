@@ -17,6 +17,15 @@ public static extern bool CloseHandle(IntPtr hObject);
 public static extern bool QueryFullProcessImageName(IntPtr hProcess, uint dwFlags, System.Text.StringBuilder lpExeName, ref uint lpdwSize);
 '@
 
+# Keep terminal-host list in sync with session-start.ps1 / session-picker-daemon.ps1.
+$terminalHostPatterns = @('mintty.exe', 'alacritty*')
+function Test-IsTerminalHost {
+    param([string]$Name)
+    if (-not $Name) { return $false }
+    foreach ($p in $terminalHostPatterns) { if ($Name -like $p) { return $true } }
+    return $false
+}
+
 function Test-SessionLive {
     param([int64]$HwndInt, [int]$ExpectedPid)
     $hwnd = [IntPtr]$HwndInt
@@ -31,7 +40,7 @@ function Test-SessionLive {
     $ok = [W.P]::QueryFullProcessImageName($h, 0, $sb, [ref]$sz)
     [void][W.P]::CloseHandle($h)
     if (-not $ok) { return $false }
-    return ((Split-Path -Leaf $sb.ToString()) -eq 'mintty.exe')
+    return (Test-IsTerminalHost (Split-Path -Leaf $sb.ToString()))
 }
 
 function Resolve-TranscriptPath {

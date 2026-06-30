@@ -17,6 +17,8 @@ Add-Type -Namespace W -Name P -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
 [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
 [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextLength(IntPtr hWnd);
+[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
 [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
 [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr hObject);
 [DllImport("kernel32.dll")] public static extern bool QueryFullProcessImageName(IntPtr hProcess, uint dwFlags, System.Text.StringBuilder lpExeName, ref uint lpdwSize);
@@ -156,6 +158,17 @@ public class HotkeyForm : Form {
 }
 
 # ========= Helpers =========
+# Terminal hosts that present one OS window per Claude session. Keep in sync with
+# session-start.ps1. Alacritty is matched by prefix because the portable build's
+# filename carries its version (e.g. "Alacritty-v0.17.0-portable.exe").
+$terminalHostPatterns = @('mintty.exe', 'alacritty*')
+function Test-IsTerminalHost {
+    param([string]$Name)
+    if (-not $Name) { return $false }
+    foreach ($p in $terminalHostPatterns) { if ($Name -like $p) { return $true } }
+    return $false
+}
+
 function Test-SessionLive {
     param([int64]$HwndInt, [int]$ExpectedPid)
     $hwnd = [IntPtr]$HwndInt
@@ -170,7 +183,7 @@ function Test-SessionLive {
     $ok = [W.P]::QueryFullProcessImageName($h, 0, $sb, [ref]$sz)
     [void][W.P]::CloseHandle($h)
     if (-not $ok) { return $false }
-    return ((Split-Path -Leaf $sb.ToString()) -eq 'mintty.exe')
+    return (Test-IsTerminalHost (Split-Path -Leaf $sb.ToString()))
 }
 
 function Resolve-TranscriptPath {
@@ -228,6 +241,32 @@ function Get-SessionStatus {
     return "idle"
 }
 
+function Get-WindowTitle {
+    param([int64]$HwndInt)
+    $hwnd = [IntPtr]$HwndInt
+    if (-not [W.P]::IsWindow($hwnd)) { return '' }
+    $len = [W.P]::GetWindowTextLength($hwnd)
+    if ($len -le 0) { return '' }
+    $sb = New-Object System.Text.StringBuilder ($len + 1)
+    [void][W.P]::GetWindowText($hwnd, $sb, $sb.Capacity)
+    return $sb.ToString()
+}
+
+# Turn a raw terminal title into a clean session name:
+#  - drop the "Administrator: " prefix Windows adds to elevated terminals
+#  - drop the leading status glyph Claude prepends (braille spinner U+2800-28FF,
+#    sparkle U+2728/2733/2734, dot U+25CF/2022) -- the picker has its own status column
+#  - collapse whitespace and trim (mintty right-pads titles with spaces)
+function Format-SessionName {
+    param([string]$Title, [int]$MaxLen = 90)
+    if (-not $Title) { return '' }
+    $t = $Title -replace '^\s*Administrator:\s*', ''
+    $t = $t -replace '^[\s\p{So}]+', ''
+    $t = ($t -replace '\s+', ' ').Trim()
+    if ($t.Length -gt $MaxLen) { $t = $t.Substring(0, $MaxLen - 3) + '...' }
+    return $t
+}
+
 function Get-Sessions {
     $dir = Join-Path $env:USERPROFILE ".claude\session-windows"
     $result = @()
@@ -243,10 +282,16 @@ function Get-Sessions {
                 $snippet = Get-LastUserPromptSnippet -TranscriptPath $tp -SessionId $d.session_id
                 $live = Test-SessionLive -HwndInt $d.hwnd -ExpectedPid $d.pid
                 $status = Get-SessionStatus -SessionId $d.session_id
+                # Prefer the live terminal window title (Claude keeps it set to the task
+                # summary); fall back to the cwd folder + last-prompt snippet when there's
+                # no usable title (dead window, or a terminal that doesn't set one).
+                $title = Format-SessionName (Get-WindowTitle -HwndInt $d.hwnd)
+                if ($title) { $name = $title; $secondary = '' }
+                else        { $name = $project; $secondary = $snippet }
                 $result += [PSCustomObject]@{
                     File = $_.FullName; SessionId = $d.session_id; Project = $project
                     Snippet = $snippet; Hwnd = [int64]$d.hwnd; Pid = [int]$d.pid; Live = $live
-                    Status = $status
+                    Status = $status; Name = $name; Secondary = $secondary
                 }
             } catch { }
         }
@@ -475,16 +520,16 @@ function Show-Picker {
         $lbl0.Text = ' '
 
         $lbl1 = New-Object System.Windows.Controls.TextBlock
-        $lbl1.Text = "$numPrefix[" ; $lbl1.Foreground = [System.Windows.Media.Brushes]::Gray
+        $lbl1.Text = $numPrefix ; $lbl1.Foreground = [System.Windows.Media.Brushes]::Gray
 
         $lbl2 = New-Object System.Windows.Controls.TextBlock
-        $lbl2.Text = $s.Project ; $lbl2.FontWeight = 'Bold'
+        $lbl2.Text = $s.Name ; $lbl2.FontWeight = 'Bold'
 
         $lbl3 = New-Object System.Windows.Controls.TextBlock
-        $lbl3.Text = "]  " ; $lbl3.Foreground = [System.Windows.Media.Brushes]::Gray
+        $lbl3.Text = $(if ($s.Secondary) { "   " } else { "" }) ; $lbl3.Foreground = [System.Windows.Media.Brushes]::Gray
 
         $lbl4 = New-Object System.Windows.Controls.TextBlock
-        $lbl4.Text = $s.Snippet
+        $lbl4.Text = $s.Secondary ; $lbl4.Foreground = [System.Windows.Media.Brushes]::Gray
 
         $lbl5 = New-Object System.Windows.Controls.TextBlock
         $lbl5.Text = $suffix ; $lbl5.Foreground = [System.Windows.Media.Brushes]::OrangeRed ; $lbl5.FontStyle = 'Italic'

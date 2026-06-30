@@ -9,6 +9,17 @@ function Log {
     Add-Content -LiteralPath $logPath -Value "[$ts] $Msg"
 }
 
+# Terminal hosts the switcher supports (one OS window per session). Keep in sync
+# with session-start.ps1 / session-picker-daemon.ps1. Alacritty matched by prefix
+# because the portable build name carries its version (e.g. Alacritty-v0.17.0-portable.exe).
+$terminalHostPatterns = @('mintty.exe', 'alacritty*')
+function Test-IsTerminalHost {
+    param([string]$Name)
+    if (-not $Name) { return $false }
+    foreach ($p in $terminalHostPatterns) { if ($Name -like $p) { return $true } }
+    return $false
+}
+
 Log "--- click received: uri=`"$Uri`" ---"
 
 if (-not $Uri) { Log "no URI arg, exit"; exit 0 }
@@ -75,7 +86,7 @@ $ok = [W.C]::QueryFullProcessImageName($h, 0, $sb, [ref]$sz)
 [void][W.C]::CloseHandle($h)
 if (-not $ok) { Log "QueryFullProcessImageName failed"; exit 0 }
 $name = Split-Path -Leaf $sb.ToString()
-if ($name -ne 'mintty.exe') { Log "process name mismatch: got '$name'"; exit 0 }
+if (-not (Test-IsTerminalHost $name)) { Log "process name not a supported terminal host: got '$name'"; exit 0 }
 
 # All checks passed
 Log ("switching to HWND 0x{0:X}" -f $hwndInt)

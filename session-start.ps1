@@ -65,19 +65,33 @@ function Get-ParentPid {
     return [int]$pbi.InheritedFromUniqueProcessId
 }
 
-# Walk ancestors to find mintty.exe
+# Terminal hosts that present exactly ONE OS window per Claude session, so the
+# picker can switch to a specific session. mintty.exe = Git Bash. Alacritty is
+# matched by prefix because the portable build is named with its version baked in
+# (e.g. "Alacritty-v0.17.0-portable.exe"), which changes on every update.
+# To support another one-window-per-process terminal, add a pattern here AND in
+# session-picker-daemon.ps1's Test-SessionLive.
+$terminalHostPatterns = @('mintty.exe', 'alacritty*')
+function Test-IsTerminalHost {
+    param([string]$Name)
+    if (-not $Name) { return $false }
+    foreach ($p in $terminalHostPatterns) { if ($Name -like $p) { return $true } }
+    return $false
+}
+
+# Walk ancestors to find the terminal host window process
 $cur = [int]$PID
-$minttyPid = 0
+$hostPid = 0
 for ($i = 0; $i -lt 20; $i++) {
     $name = Get-ProcName -ProcessId $cur
-    if ($name -eq 'mintty.exe') { $minttyPid = $cur; break }
+    if (Test-IsTerminalHost $name) { $hostPid = $cur; break }
     $cur = Get-ParentPid -ProcessId $cur
     if ($cur -le 0) { break }
 }
-if ($minttyPid -eq 0) { exit 2 }
+if ($hostPid -eq 0) { exit 2 }
 
 # Find visible top-level window for that PID
-$script:targetPid = $minttyPid
+$script:targetPid = $hostPid
 $script:found = [IntPtr]::Zero
 $cb = [W.N+EnumWindowsProc] {
     param($hwnd, $lparam)
@@ -100,7 +114,7 @@ $file = Join-Path $dir "$sessionId.json"
 $mapping = [ordered]@{
     session_id      = $sessionId
     hwnd            = [int64]$script:found
-    pid             = $minttyPid
+    pid             = $hostPid
     cwd             = $cwd
     transcript_path = $transcriptPath
     captured_at     = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fffK')
