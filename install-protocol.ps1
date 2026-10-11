@@ -7,7 +7,17 @@ if (-not (Test-Path $scriptPath)) {
 }
 $fullScriptPath = (Resolve-Path $scriptPath).ProviderPath
 
-$cmd = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$fullScriptPath`" `"%1`""
+$sourcePath = Join-Path $PSScriptRoot 'AgentRecall.cs'
+$launcherPath = Join-Path $PSScriptRoot 'AgentRecall.exe'
+$compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+if (-not (Test-Path -LiteralPath $compiler)) { throw 'The Windows .NET Framework compiler is unavailable.' }
+$temporaryExe = Join-Path $PSScriptRoot ('AgentRecall-' + [guid]::NewGuid().ToString('N') + '.exe')
+try {
+    & $compiler /nologo /target:winexe /optimize+ "/out:$temporaryExe" $sourcePath
+    if ($LASTEXITCODE -ne 0) { throw 'Session protocol launcher did not compile.' }
+    Move-Item -LiteralPath $temporaryExe -Destination $launcherPath -Force
+} finally { if (Test-Path -LiteralPath $temporaryExe) { Remove-Item -LiteralPath $temporaryExe } }
+$cmd = "`"$launcherPath`" `"%1`""
 
 $basePath = "HKCU:\Software\Classes\clauderecall"
 

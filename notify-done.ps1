@@ -1,4 +1,5 @@
 $ErrorActionPreference = "SilentlyContinue"
+. (Join-Path $PSScriptRoot 'agent-sessions.ps1')
 
 # Read Stop hook JSON from stdin
 $raw = [Console]::In.ReadToEnd()
@@ -13,14 +14,17 @@ if ($data -and $data.cwd) {
     $projectName = Split-Path -Leaf $data.cwd
 }
 
-# Last user-typed prompt from transcript (string-content user messages only;
-# array-content ones are tool_results/skill outputs, not user input)
+# Latest assistant answer, falling back to the latest typed prompt.
 $lastPrompt = ""
 if ($data -and $data.transcript_path -and (Test-Path $data.transcript_path)) {
-    $lines = Get-Content -LiteralPath $data.transcript_path
+    $lines = @(Read-AgentTail -Path $data.transcript_path)
     for ($i = $lines.Count - 1; $i -ge 0; $i--) {
         try {
             $entry = $lines[$i] | ConvertFrom-Json
+            if ($entry.type -eq "assistant" -and $entry.message) {
+                $answer = @($entry.message.content | Where-Object { $_.type -eq "text" } | ForEach-Object { $_.text }) -join " "
+                if ($answer) { $lastPrompt=$answer; break }
+            }
             if ($entry.type -eq "user" -and $entry.message -and ($entry.message.content -is [string])) {
                 $lastPrompt = $entry.message.content
                 break
@@ -32,12 +36,6 @@ if ($data -and $data.transcript_path -and (Test-Path $data.transcript_path)) {
 # Collapse whitespace
 $lastPrompt = ($lastPrompt -replace '\s+', ' ').Trim()
 
-# Derive "main idea": first sentence (stops at . ! ? or newline), truncated to 60 chars
-$mainIdea = $lastPrompt
-if ($mainIdea -match '^([^\.\!\?\n]+)') { $mainIdea = $matches[1].Trim() }
-if ($mainIdea.Length -gt 60) { $mainIdea = $mainIdea.Substring(0, 57) + "..." }
-if (-not $mainIdea) { $mainIdea = "Session complete" }
-
 # Update status sidecar so the picker shows the orange "done" dot
 if ($sessionId) {
     $statusDir = Join-Path $env:USERPROFILE ".claude\session-windows"
@@ -46,33 +44,7 @@ if ($sessionId) {
     Set-Content -LiteralPath $statusFile -Value "done" -Encoding ASCII -ErrorAction SilentlyContinue
 }
 
-# Beep
-try { [console]::beep(800, 200) } catch { }
-
-# Toast via BurntToast (handles AppId registration + click activation properly)
-try { Import-Module BurntToast -ErrorAction Stop } catch { exit 0 }
-
-$bodyText = "$projectName - done"
-
-$silentAudio = New-BTAudio -Silent
-
-if ($sessionId) {
-    $encodedId = [System.Uri]::EscapeDataString($sessionId)
-    $launchUri = "clauderecall://$encodedId"
-
-    # Toast-body click -> protocol activation
-    $t1 = New-BTText -Text $mainIdea
-    $t2 = New-BTText -Text $bodyText
-    $binding = New-BTBinding -Children $t1, $t2
-    $visual  = New-BTVisual -BindingGeneric $binding
-
-    # Also include a visible button as belt-and-suspenders (some Windows configs route
-    # button clicks even when body clicks don't)
-    $btn    = New-BTButton -Content "Switch" -Arguments $launchUri -ActivationType Protocol
-    $action = New-BTAction -Buttons $btn
-
-    $content = New-BTContent -Visual $visual -Actions $action -Audio $silentAudio -Launch $launchUri -ActivationType Protocol
-    Submit-BTNotification -Content $content
-} else {
-    New-BurntToastNotification -Text $mainIdea, $bodyText -Silent
+# The resident picker owns completion cards and plays the optional sound once.
+if ($sessionId -and (ConvertFrom-AgentRecallUri "clauderecall://Claude/$sessionId")) {
+    Send-AgentNotification -Provider Claude -SessionId $sessionId -Name $projectName -Snippet $lastPrompt
 }

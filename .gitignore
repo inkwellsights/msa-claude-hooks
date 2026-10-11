@@ -1,1 +1,14 @@
 *.log
+
+# Local runtime state and generated files
+*.exe
+*.dll
+*.tmp
+agent-settings.json
+agent-monitor-ready.json
+native-session-targets.json
+native-toast-ready.json
+popup-queue/
+native-toast-queue/
+backups/
+Tests/artifacts/

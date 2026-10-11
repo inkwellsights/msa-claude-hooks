@@ -6,12 +6,21 @@ function Log { param([string]$m) "[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH
 
 try {
 
+. (Join-Path $PSScriptRoot 'agent-sessions.ps1')
+$script:codexStates = @{}
+$script:codexAcknowledged = @{}
+$script:liveSessions = @()
+
 # Single-instance guard
 $mutex = New-Object System.Threading.Mutex($false, 'Global\ClaudeSessionPickerDaemon_MSA')
 if (-not $mutex.WaitOne(0)) { Log "another instance already running; exiting"; exit 0 }
 Log "daemon starting, PID $PID"
+if ((Test-Path -LiteralPath (Join-Path $PSScriptRoot 'AgentNotifications.exe')) -and -not (Test-AgentNativeNotificationService)) {
+    Start-Process -FilePath (Join-Path $PSScriptRoot 'AgentNotifications.exe') -WindowStyle Hidden
+}
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
+. (Join-Path $PSScriptRoot 'completion-popups.ps1')
 
 Add-Type -Namespace W -Name P -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
@@ -268,33 +277,15 @@ function Format-SessionName {
 }
 
 function Get-Sessions {
-    $dir = Join-Path $env:USERPROFILE ".claude\session-windows"
-    $result = @()
-    if (-not (Test-Path -LiteralPath $dir)) { return ,$result }
-    Get-ChildItem -LiteralPath $dir -Filter "*.json" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        ForEach-Object {
-            try {
-                $d = Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json
-                $project = if ($d.cwd) { Split-Path -Leaf $d.cwd } else { "Claude" }
-                $tp = $d.transcript_path
-                if (-not $tp) { $tp = Resolve-TranscriptPath -Cwd $d.cwd -SessionId $d.session_id }
-                $snippet = Get-LastUserPromptSnippet -TranscriptPath $tp -SessionId $d.session_id
-                $live = Test-SessionLive -HwndInt $d.hwnd -ExpectedPid $d.pid
-                $status = Get-SessionStatus -SessionId $d.session_id
-                # Prefer the live terminal window title (Claude keeps it set to the task
-                # summary); fall back to the cwd folder + last-prompt snippet when there's
-                # no usable title (dead window, or a terminal that doesn't set one).
-                $title = Format-SessionName (Get-WindowTitle -HwndInt $d.hwnd)
-                if ($title) { $name = $title; $secondary = '' }
-                else        { $name = $project; $secondary = $snippet }
-                $result += [PSCustomObject]@{
-                    File = $_.FullName; SessionId = $d.session_id; Project = $project
-                    Snippet = $snippet; Hwnd = [int64]$d.hwnd; Pid = [int]$d.pid; Live = $live
-                    Status = $status; Name = $name; Secondary = $secondary
-                }
-            } catch { }
+    $result = @(Get-AgentSessions)
+    foreach ($s in $result) {
+        $s.Name = "[$($s.Provider)] " + (Format-SessionName $s.Name)
+        if ($s.Provider -eq 'Codex' -and $script:codexStates.ContainsKey($s.SessionId)) {
+            $st = $script:codexStates[$s.SessionId]
+            $s.Status = $st.Status
+            if ($st.EventKey -and $script:codexAcknowledged[$s.SessionId] -eq $st.EventKey) { $s.Status = 'idle' }
         }
+    }
     return ,$result
 }
 
@@ -302,10 +293,10 @@ function Get-Sessions {
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Claude Sessions"
+        Title="Agent Sessions"
         WindowStartupLocation="CenterScreen"
         SizeToContent="Height"
-        Width="720"
+        Width="920"
         Background="#151515"
         Foreground="#EEE"
         FontFamily="Segoe UI"
@@ -325,7 +316,15 @@ function Get-Sessions {
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
       </Grid.RowDefinitions>
-      <TextBlock Grid.Row="0" Text="Active Claude Sessions" FontWeight="Bold" FontSize="14" Margin="4,0,0,8" Foreground="#EEE"/>
+      <StackPanel Grid.Row="0">
+        <DockPanel Margin="4,0,0,8">
+          <Button Name="SettingsButton" DockPanel.Dock="Right" Content="Settings" Padding="10,3" Background="#303030" Foreground="#EEE" BorderBrush="#555"/>
+          <TextBlock Text="Active Codex and Claude Sessions" FontWeight="Bold" FontSize="14" Foreground="#EEE"/>
+        </DockPanel>
+        <StackPanel Name="SettingsPanel" Visibility="Collapsed" Background="#222" Margin="4,0,4,8">
+          <CheckBox Name="SoundToggle" Content="Completion sound" Foreground="#EEE" Margin="10,8"/>
+        </StackPanel>
+      </StackPanel>
       <ListBox Name="SessionList" Grid.Row="1" Background="Transparent" Foreground="#EEE" BorderThickness="0" MaxHeight="560" FontSize="13" Focusable="False">
         <ListBox.ItemContainerStyle>
           <Style TargetType="ListBoxItem">
@@ -351,6 +350,17 @@ $reader = New-Object System.Xml.XmlNodeReader $xaml
 $script:window = [Windows.Markup.XamlReader]::Load($reader)
 $script:list   = $script:window.FindName('SessionList')
 $script:activated = $false
+$script:settingsPanel = $script:window.FindName('SettingsPanel')
+$script:soundToggle = $script:window.FindName('SoundToggle')
+$script:soundToggle.IsChecked = (Get-AgentSettings).SoundEnabled
+$script:window.FindName('SettingsButton').Add_Click({
+    if ($script:settingsPanel.Visibility -eq 'Visible') { $script:settingsPanel.Visibility = 'Collapsed' }
+    else { $script:soundToggle.IsChecked = (Get-AgentSettings).SoundEnabled; $script:settingsPanel.Visibility = 'Visible' }
+})
+$script:soundToggle.Add_Click({
+    try { Set-AgentSound -Enabled ([bool]$script:soundToggle.IsChecked); Log "completion sound=$($script:soundToggle.IsChecked)" }
+    catch { Log "settings save failed: $_" }
+})
 
 $script:window.Add_Closing({ param($s, $e) $e.Cancel = $true; $s.Hide() })
 $script:window.Add_Deactivated({
@@ -369,19 +379,25 @@ $activate = {
     if (-not $sel) { return }
     $s = $sel.Tag
     $script:activated = $true
-    if (-not $s.Live) {
-        Remove-Item -LiteralPath $s.File -ErrorAction SilentlyContinue
-    } else {
-        [W.P]::SwitchToThisWindow([IntPtr]([int64]$s.Hwnd), $true)
+    Log "activate request provider=$($s.Provider) sid=$($s.SessionId) hwnd=$($s.Hwnd) pid=$($s.Pid) foreground=$([AgentWindows]::GetForegroundWindow())"
+    # Keep the picker foreground until activation has been requested. Hiding first
+    # restores another process and can revoke our foreground activation permission.
+    if ([AgentWindows]::Focus([int64]$s.Hwnd, [int]$s.Pid)) {
+        Log "picker focus verified hwnd=$($s.Hwnd)"
         # User opened this terminal via picker -- clear 'done' dot. Leaves
         # 'running' alone (still in progress) and 'idle' alone (nothing to clear).
         try {
-            if ($s.SessionId -and $s.Status -eq 'done') {
+            if ($s.Provider -eq 'Codex') {
+                if ($script:codexStates.ContainsKey($s.SessionId)) { $script:codexAcknowledged[$s.SessionId] = $script:codexStates[$s.SessionId].EventKey }
+            } elseif ($s.SessionId -and $s.Status -eq 'done') {
                 $statusFile = Join-Path $env:USERPROFILE ".claude\session-windows\$($s.SessionId).status"
                 Remove-Item -LiteralPath $statusFile -ErrorAction SilentlyContinue
                 Log "cleared done status for $($s.SessionId)"
             }
         } catch { Log "clear status error: $_" }
+    } else {
+        Log "focus failed for $($s.Provider) $($s.SessionId) hwnd=$($s.Hwnd)"
+        [System.Windows.Forms.MessageBox]::Show('This session window has closed or Windows prevented switching. Open the picker again to refresh.', 'Agent Sessions') | Out-Null
     }
     $script:window.Hide()
 }
@@ -475,6 +491,13 @@ function Update-StatusIcons {
         if (-not $sp -or $sp.Children.Count -lt 1) { continue }
         $iconLbl = $sp.Children[0]
         $st = Get-SessionStatus -SessionId $sid
+        if ($item.Tag.Provider -eq 'Codex') {
+            $st = 'idle'
+            if ($script:codexStates.ContainsKey($sid)) {
+                $cs = $script:codexStates[$sid]; $st = $cs.Status
+                if ($cs.EventKey -and $script:codexAcknowledged[$sid] -eq $cs.EventKey) { $st = 'idle' }
+            }
+        }
         if ($st -eq 'running') {
             $iconLbl.Text = $frame
             $iconLbl.Foreground = [System.Windows.Media.Brushes]::LimeGreen
@@ -500,7 +523,7 @@ function Show-Picker {
     $script:list.Items.Clear()
     $sessions = Get-Sessions
     $tGet = $sw.ElapsedMilliseconds
-    if ($sessions.Count -eq 0) { Log ("Show: no sessions ({0}ms)" -f $tGet); return }
+    if ($sessions.Count -eq 0) { Log ("Show: no live sessions ({0}ms)" -f $tGet) }
 
     $idx = 0
     foreach ($s in $sessions) {
@@ -693,8 +716,67 @@ if (-not $registered) {
 }
 Log "hotkey Alt+backtick registered; entering message loop"
 
+# Poll transcripts of live CLI processes. This also works for terminals that were
+# already open before installation; the existing Codex notify integration is untouched.
+function Update-CodexCompletions {
+    $script:liveSessions = @(Get-AgentSessions)
+    Write-AgentNativeSessionSnapshot -Sessions $script:liveSessions
+    foreach ($s in $script:liveSessions) {
+        if ($s.Provider -ne 'Codex' -or -not $s.TranscriptPath) { continue }
+        $sid = $s.SessionId
+        $file = Get-Item -LiteralPath $s.TranscriptPath -ErrorAction SilentlyContinue
+        if (-not $file) { continue }
+        $fingerprint = "$($file.Length)|$($file.LastWriteTimeUtc.Ticks)"
+        $previous = $script:codexStates[$sid]
+        if ($previous -and $previous.Fingerprint -eq $fingerprint) { continue }
+        $state = Get-CodexFileState -Path $s.TranscriptPath
+        $state | Add-Member -NotePropertyName Fingerprint -NotePropertyValue $fingerprint
+        $script:codexStates[$sid] = $state
+        # First observation is a baseline, so old completions never replay on startup.
+        if ($previous -and $state.Status -eq 'done' -and $state.EventKey -and $state.EventKey -ne $previous.EventKey) {
+            Log "Codex complete sid=$sid key=$($state.EventKey)"
+            Send-AgentNotification -Provider Codex -SessionId $sid -Name $s.Name -Snippet $state.Snippet
+        }
+    }
+    $readyIds = @($script:liveSessions | Where-Object { $_.Provider -eq 'Codex' -and $script:codexStates.ContainsKey($_.SessionId) } | ForEach-Object { $_.SessionId } | Sort-Object)
+    $signature = $readyIds -join '|'
+    if ($script:monitorReadySignature -ne $signature -or -not $script:monitorReadyWritten) {
+        @{ Pid=$PID; SessionIds=$readyIds; PopupReady=$true } | ConvertTo-Json | Set-Content -LiteralPath $script:agentMonitorReadyPath -Encoding UTF8
+        $script:monitorReadySignature=$signature; $script:monitorReadyWritten=$true
+    }
+}
+Update-CodexCompletions
+$script:completionTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:completionTimer.Interval = [TimeSpan]::FromSeconds(3)
+$script:completionTimer.Add_Tick({ try { Update-CodexCompletions } catch { Log "completion monitor error: $_" } })
+$script:completionTimer.Start()
+
+# Tray entry also exposes settings when there are no live sessions.
+$script:tray = New-Object System.Windows.Forms.NotifyIcon
+$script:tray.Icon = [System.Drawing.SystemIcons]::Application
+$script:tray.Text = 'Codex and Claude Sessions'
+$script:trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$script:openItem = $script:trayMenu.Items.Add('Open sessions (Alt + backtick)')
+$script:openItem.Add_Click({ Show-Picker })
+$script:recentCompletionsMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Recent completions')
+[void]$script:trayMenu.Items.Add($script:recentCompletionsMenu)
+$script:soundItem = New-Object System.Windows.Forms.ToolStripMenuItem('Completion sound')
+$script:soundItem.CheckOnClick = $true
+$script:soundItem.Checked = (Get-AgentSettings).SoundEnabled
+$script:soundItem.Add_Click({ try { Set-AgentSound -Enabled $script:soundItem.Checked } catch { Log "tray settings error: $_" } })
+[void]$script:trayMenu.Items.Add($script:soundItem)
+$script:trayMenu.Add_Opening({ $script:soundItem.Checked = (Get-AgentSettings).SoundEnabled; Update-AgentCompletionTray })
+$script:tray.ContextMenuStrip = $script:trayMenu
+$script:tray.Add_DoubleClick({ Show-Picker })
+$script:tray.Visible = $true
+
 # ========= Message loop =========
+$script:popupTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:popupTimer.Interval = [TimeSpan]::FromMilliseconds(300)
+$script:popupTimer.Add_Tick({ try { Update-AgentCompletionPopups } catch { Log "popup error: $_" } })
+$script:popupTimer.Start()
 [System.Windows.Forms.Application]::Run()
+$script:tray.Dispose()
 Log "message loop exited (unexpected)"
 
 } catch {
